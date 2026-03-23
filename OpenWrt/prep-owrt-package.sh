@@ -1,0 +1,231 @@
+#!/bin/sh
+# shellcheck disable=SC2046,SC2034,SC2016
+
+# prepares geoip-shell for OpenWrt (without compilation)
+#  - to build only for firewall3+iptables or firewall4+nftables, add '3' or '4' as an argument
+
+: "${pkg_ver:=r1}"
+
+die() {
+	# if first arg is a number, assume it's the exit code
+	unset die_args
+	for die_arg in "$@"; do
+		die_args="$die_args$die_arg$_nl"
+	done
+
+	[ "$die_args" ] && {
+		IFS="$_nl"
+		for arg in $die_args; do
+			printf '%s\n' "$arg" >&2
+		done
+	}
+	exit 1
+}
+
+[ ! "$_OWRTFW" ] &&
+	case "$1" in
+		'') ;;
+		3|4|all) _OWRTFW="$1" ;;
+		"3 4"|"4 3") _OWRTFW=all ;;
+		*) die "Invalid openwrt firewall version '$1'. Expected '3' or '4' or 'all'."
+	esac
+case "$_OWRTFW" in "3 4"|"4 3") _OWRTFW=all; esac
+: "${_OWRTFW:=all}"
+
+### Variables
+p_name="geoip-shell"
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+src_dir="${script_dir%/*}"
+INSTALL_DIR="/usr/bin"
+LIB_DIR="/usr/lib/$p_name"
+CONF_DIR="/etc/$p_name"
+init_dir="/etc/init.d"
+
+curr_ver="$(grep -o -m 1 'curr_ver=.*$' "$src_dir/${p_name}-geoinit.sh" | cut -d\" -f2)"
+
+_nl='
+'
+export _OWRTFW initsys=procd curr_sh_g="/bin/sh"
+PATH_orig="$PATH"
+
+### Main
+
+gsh_dir="$HOME/geoip-shell"
+build_dir="$gsh_dir/owrt-build"
+files_dir="$build_dir/files"
+
+# Prepare geoip-shell for OpenWrt
+
+printf '\n%s\n\n' "*** Preparing $p_name for OpenWrt... ***"
+
+rm -rf "$build_dir"
+
+mkdir -p "$files_dir$INSTALL_DIR" "$files_dir$LIB_DIR" "$files_dir$init_dir" ||
+	die "*** Failed to create directories for $p_name build. ***"
+
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin" inst_root_gs="$files_dir"
+printf '%s\n' "*** Running '$src_dir/$p_name-install.sh'... ***"
+sh "$src_dir/$p_name-install.sh" || die "*** Failed to run the -install script or it reported an error. ***"
+echo
+export PATH="$PATH_orig"
+
+cp "$script_dir/$p_name-owrt-uninstall.sh" "${files_dir}${LIB_DIR}" ||
+	die "*** Failed to copy '$script_dir/$p_name-owrt-uninstall.sh' to '${files_dir}${LIB_DIR}'. ***"
+
+echo "*** Sanitizing the build... ***"
+rm -f "${files_dir}${INSTALL_DIR}/${p_name}-uninstall.sh"
+rm -f "${files_dir}${CONF_DIR}/${p_name}.conf"
+
+# remove debug stuff
+sed -Ei '/\[[[:blank:]]*"\$debugmode"[[:blank:]]*\][[:blank:]]*&&/d;
+	/^[[:blank:]]*debugprint[[:blank:]]+.*"[[:blank:]]*[;]{0,1}[[:blank:]]*$/d;
+	/^[[:blank:]]*debugprint[[:blank:]]+.*;[[:blank:]]*[;]{0,1}[[:blank:]]*$/d;
+	/^[[:blank:]]*debugprint[[:blank:]]+.*$/d;
+	s/^[[:blank:]]*(setdebug|debugentermsg|debugexitmsg)$//g;
+	s/[[:blank:]]*debugprint[[:blank:]]+.*"[[:blank:]]*[;]{0,1}//g;
+	s/[[:blank:]]*debugprint[[:blank:]]+.*;[[:blank:]]*[;]{0,1}//g;
+	s/[[:blank:]]*debugprint[[:blank:]]+.*$//g;
+	s/^[[:blank:]]*(setdebug|debugentermsg|debugexitmsg)$//g;
+	s/ debugmode_arg=1//g;' \
+	$(find -- "$build_dir"/* -print | grep '.sh$')
+sed -i -n -e /"#@"/\{:1 -e n\;/"#@"/\{:2 -e n\;p\;b2 -e \}\;b1 -e \}\;p "${files_dir}${LIB_DIR}/$p_name-lib-common.sh" || exit 1
+
+# prepare Makefile
+printf '%s\n' "*** Creating '$build_dir/Makefile'... ***"
+cd "$files_dir" || die "*** Failed to cd into '$files_dir' ***"
+{
+	awk '{gsub(/\$p_name/,p); gsub(/\$INSTALL_DIR/,i); gsub(/\$CONF_DIR/,c); gsub(/\$curr_ver/,v); gsub(/\$pkg_ver/,r); gsub(/\$LIB_DIR/,L)}1' \
+		p="$p_name" c="$CONF_DIR" v="$curr_ver" r="${pkg_ver#r}" i="$INSTALL_DIR" L="$LIB_DIR" "$script_dir/makefile.tpl"
+
+	printf '\n%s\n' "define Package/$p_name/install/Default"
+
+	find -- * -print | grep -vE '(ipt|nft)' |
+	awk '$0==c||$0==i||$0==n||$0==l {print "\n\t$(INSTALL_DIR) $(1)/" $0} \
+		$0~f {print "\t$(INSTALL_CONF) ./files/" $0 " $(1)" s c} \
+		$0~a {print "\t$(INSTALL_BIN) ./files/" $0 " $(1)" s i} \
+		$0~t {print "\t$(INSTALL_BIN) ./files/" $0 " $(1)" s n} \
+		$0~b {print "\t$(INSTALL_CONF) ./files/" $0 " $(1)" s l}' \
+			c="${CONF_DIR#"/"}" i="${INSTALL_DIR#"/"}" n="${init_dir#"/"}" l="${LIB_DIR#"/"}" s="/" \
+			f="${CONF_DIR#"/"}/" a="${INSTALL_DIR#"/"}/" t="${init_dir#"/"}/" b="${LIB_DIR#"/"}/"
+	printf '\n%s\n\n' "endef"
+} > "$build_dir/Makefile"
+
+[ "$_OWRTFW" = all ] && _OWRTFW="4 3"
+BP_calls=
+for _fw_ver in $_OWRTFW; do
+	case "$_fw_ver" in
+		3) _ipt="-iptables" _fw=ipt ;;
+		4) _ipt='' _fw=nft
+	esac
+	BP_calls="${BP_calls}\$(eval \$(call BuildPackage,$p_name$_ipt))$_nl"
+
+	printf '%s\n' "*** Adding install defines for $p_name$_ipt... ***"
+	{
+		printf '\n%s\n%s\n' "define Package/$p_name$_ipt/install" \
+			"\$(call Package/$p_name/install/Default,\$(1))"
+
+		printf '\t%s\n' "\$(INSTALL_DIR) \$(1)$LIB_DIR"
+		find -- * -print | grep -E "$_fw" |
+		awk '$0~b {print "\t$(INSTALL_CONF) ./files/" $0 " $(1)" s l}' \
+			l="${LIB_DIR#"/"}" s="/" b="${LIB_DIR#"/"}/"
+		printf '\n%s\n\n' "endef"
+	} >> "$build_dir/Makefile"
+done
+
+printf '%s\n\n' "$BP_calls" >> "$build_dir/Makefile"
+
+printf '\n%s\n' "*** Preparing documentation... ***"
+rm -rf "$build_dir/Documentation" "$build_dir/"*.md 2>/dev/null
+
+# Prepare the main README.md
+sed 's/\/OpenWrt\/README.md/OpenWrt-README.md/g' "$src_dir/README.md" | sed 's/\[\!\[image\].*//g' | \
+sed -n -e /"## \*\*Installation\*\*"/\{:1 -e n\;/"## \*\*Initial setup\*\*"/\{:2 -e p\; -e n\;b2 -e \}\;b1 -e \}\;p |
+sed 's/Post-installation, provides/Provides/;
+	s/ Except on OpenWrt, persistence.*//;
+	s/\/Documentation\///g;
+	s/[[:blank:]]`geoip-shell-uninstall.sh`//;
+	s/ (if encountering an error with running geoip-shell in LXC container.*/./' |
+sed -n '/\*\*P\.s\./q;
+	/please take a second to give it a star/n;
+	/- Installation and initial setup are easy/n;
+	/- Comes with an uninstall script/n;
+	/once the installation completes/n;
+	/require root privileges/n;
+	/shell is incompatible/n;
+	/Default source for IP lists is RIPE/n;
+	/check-ip-in-source.sh/n;
+	/if a pre-requisite is missing/n;
+	/- \[Installation\](#installation)/n;
+	/- \[P\.s\.\](#ps)/n;
+	p' |
+grep -vA1 '^[[:blank:]]*$' | grep -v '^--$' > "$build_dir/README.md"
+
+# Prepare SETUP.md
+cat "$src_dir/Documentation/SETUP.md" | sed 's/\/Documentation\///g;
+	s/`sh geoip-shell-install.sh -h`, or after installation //' |
+	sed -n '/Detected Busybox cron service/q;p' |
+	sed -n -e /"### \*\*'Your shell 'A' is supported"/\{:1 -e n\;/"Generally the simpler shells"/\{:2 -e n\;p\;b2 -e \}\;b1 -e \}\;p > \
+	"$build_dir/SETUP.md"
+
+# Prepare OpenWrt-README.md
+cat "$script_dir/README.md" |
+sed 's/Installation is possible.*//;
+	s/The distribution folder.*//;
+	s/ or via the Discussions tab on Github//;
+	s/\/README/README/g;
+	s/go ahead and use the Discussions tab, or //' |
+sed -n -e /"  _<details><summary>To download"/\{:1 -e n\;/"<\/details>"/\{:2 -e n\;p\;b2 -e \}\;b1 -e \}\;p |
+sed -n -e /"## Building an OpenWrt package"/\{:1 -e n\;/"read the comments inside that script for instructions\."/\{:2 -e n\;p\;b2 -e \}\;b1 -e \}\;p |
+sed -n -e /" please consider giving this repository a star"/q\;p |
+grep -vA1 '^[[:blank:]]*$' | grep -v '^--$' > \
+"$build_dir/OpenWrt-README.md"
+
+
+# Prepare NOTES.md
+{
+	echo "## **Prelude**
+- This document only covers geoip-shell features available on OpenWrt systems.
+- geoip-shell packages available from the OpenWrt repository are not updated as frequently as upstream geoip-shell. You can get the latest geoip-shell version from the official Github page:
+
+    https://github.com/friendly-bits/geoip-shell"
+
+	cat "$src_dir/Documentation/NOTES.md" |
+	sed 's/Which shell to use with geoip-shell.*/On OpenWrt, geoip-shell expects that the default shell is _Busybox ash_. Automatic shell detection feature implemented for other platforms is disabled on OpenWrt./;
+		/[ ]*geoip-shell detects the shell.*/d;
+		s/\/Documentation\///g;
+		s/To verify that cron jobs ran .*/To verify that cron jobs ran successfully, use the command `logread | grep geoip-shell`./;
+		s/Scripts intended as user interface .*\./The user interface is provided by \*\*geoip-shell-manage\.sh\*\* (also called by running `geoip-shell`)\./'
+} > "$build_dir/NOTES.md"
+
+# Prepare DETAILS.md
+owrt_prelude="## **Prelude**
+- This document only covers scripts installed on OpenWrt systems and only options available on OpenWrt."
+
+owrt_scripts_details="### OpenWrt-specific scripts
+- geoip-shell-lib-owrt.sh
+- geoip-shell-init
+- geoip-shell-mk-fw-include.sh
+- geoip-shell-fw-include.sh
+- geoip-shell-owrt-uninstall.sh
+
+For more information about integration with OpenWrt, read [OpenWrt-README.md](OpenWrt-README.md)
+"
+
+cat "$src_dir/Documentation/DETAILS.md" | \
+sed -n '/.*-w <ipt|nft>.*/n;p' | \
+sed -n -e /"### OpenWrt-specific scripts"/\{p\;:1 -e n\;/"^$"/\{:2 -e n\;p\;b2 -e \}\;b1 -e \}\;p | \
+sed -n -e /"## \*\*Optional script\*\*"/\{:1 -e n\;/"^$"/\{:2 -e n\;p\;b2 -e \}\;b1 -e \}\;p | \
+sed -n '/^\*\*geoip-shell-install.sh\*\*/{:1 n;/^\*\*geoip-shell-run.sh\*\*/{:2 p;n;b2;};b1;};p' | \
+sed -n '/.*geoip-shell-install.*/n;/.*geoip-shell-uninstall.*/n;p' | \
+awk '{sub(/### OpenWrt-specific scripts/,s); sub(/## \*\*Prelude\*\*/,p)}1' s="$owrt_scripts_details" p="$owrt_prelude" | \
+sed 's/\/Documentation\///g;
+	s/Scripts intended as user interface .*//;' \
+	> "$build_dir/DETAILS.md"
+
+printf '\n%s\n%s\n' "*** The new build is available here: ***" "$build_dir"
+echo
+
+PATH="$PATH_orig"
+
+:
